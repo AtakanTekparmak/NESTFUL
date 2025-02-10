@@ -3,6 +3,7 @@ import json
 import logging
 from tqdm import tqdm
 import argparse
+import re
 
 from evaluation.model import get_completion, get_completions_batch
 from evaluation.utils import (
@@ -34,52 +35,32 @@ class NESTFULEvaluator:
         self.function_map = load_function_map()
         logger.info(f"Initialized evaluator with model: {model_name}")
 
-    def parse_function_sequence(self, model_output: str) -> Optional[List[Dict]]:
-        """Parse the function sequence from the model output"""
+    def parse_function_sequence(self, model_output: str) -> List[Dict]:
+        """Parse function sequence from model output"""
         try:
-            # Try to find JSON list in code blocks
-            json_blocks = []
-            lines = model_output.split('\n')
-            in_code_block = False
-            current_block = []
-            
-            for line in lines:
-                if line.startswith('```'):
-                    if in_code_block:
-                        json_blocks.append('\n'.join(current_block))
-                        current_block = []
-                    in_code_block = not in_code_block
-                    continue
-                if in_code_block:
-                    current_block.append(line)
-            
-            # Try each JSON block
-            for block in json_blocks:
-                try:
-                    # Remove any "json" or other language identifiers
-                    block = block.replace('json\n', '').strip()
-                    sequence = json.loads(block)
-                    
-                    # Validate sequence format
-                    if not isinstance(sequence, list):
-                        continue
-                        
-                    # Convert named arguments to positional arguments
-                    for call in sequence:
-                        if not all(key in call for key in ['name', 'label', 'arguments']):
-                            continue
-                            
-                        # Convert named arguments to positional arguments
-                        args = call['arguments']
-                        if not all(k.startswith('arg_') for k in args.keys()):
-                            # Convert named args to positional args
-                            new_args = {}
-                            for i, (_, value) in enumerate(sorted(args.items())):
-                                new_args[f'arg_{i}'] = value
-                            call['arguments'] = new_args
-                    
-                    logger.info(f"Parsed function sequence from json code block: {str(sequence)[:100]}...")
+            # First try to parse the entire output as JSON
+            try:
+                sequence = json.loads(model_output)
+                if isinstance(sequence, list):
+                    logger.info(f"Parsed function sequence directly: {str(sequence)[:100]}...")
                     return sequence
+            except json.JSONDecodeError:
+                pass
+
+            # Look for code blocks with JSON content
+            code_blocks = re.findall(r'```(?:json)?\s*(.*?)```', model_output, re.DOTALL)
+            if not code_blocks:
+                # Try to find JSON array without code blocks
+                matches = re.findall(r'\[(.*?)\]', model_output, re.DOTALL)
+                if matches:
+                    code_blocks = [f"[{match}]" for match in matches]
+
+            for block in code_blocks:
+                try:
+                    sequence = json.loads(block)
+                    if isinstance(sequence, list):
+                        logger.info(f"Parsed function sequence from json code block: {str(sequence)[:100]}...")
+                        return sequence
                 except json.JSONDecodeError:
                     continue
                 except Exception as e:
@@ -87,11 +68,11 @@ class NESTFULEvaluator:
                     continue
             
             logger.warning("No valid JSON found in json code blocks")
-            return None
+            return []
             
         except Exception as e:
             logger.error(f"Error parsing function sequence: {str(e)}")
-            return None
+            return []
 
     def execute_function_sequence(
         self,
