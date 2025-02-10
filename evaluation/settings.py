@@ -23,3 +23,8 @@ PROVIDER_URLS = {
     "vllm": (VLLM_URL, "api_key"),
     "openrouter": (OPENROUTER_URL, OPENROUTER_API_KEY),
 }
+
+# Function loading settings
+EXECUTABLE_FUNCTIONS_DIR = "data_v2/executable_functions"
+FUNCTION_MAP_PATH = os.path.join(EXECUTABLE_FUNCTIONS_DIR, "func_file_map.json")
+BASIC_FUNCTIONS_PATH = os.path.join(EXECUTABLE_FUNCTIONS_DIR, "basic_functions.py")
