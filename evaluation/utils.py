@@ -65,10 +65,23 @@ def load_function_map(map_path: str = FUNCTION_MAP_PATH) -> Dict[str, str]:
         A dictionary mapping function names to their file paths.
     """
     try:
+        # First load the basic functions
+        basic_functions_path = os.path.join(EXECUTABLE_FUNCTIONS_DIR, "basic_functions.py")
+        basic_module = load_module_from_file(basic_functions_path)
+        basic_funcs = {
+            name: "basic_functions.py" 
+            for name, obj in vars(basic_module).items() 
+            if callable(obj) and not name.startswith('_')
+        }
+        
+        # Then load the function map from JSON
         with open(map_path, 'r') as f:
             func_map = json.load(f)
-            logger.info(f"Loaded function map with {len(func_map)} functions")
-            return func_map
+        
+        # Combine both maps, giving priority to individual function files
+        combined_map = {**basic_funcs, **func_map}
+        logger.info(f"Loaded function map with {len(combined_map)} functions")
+        return combined_map
     except FileNotFoundError:
         raise FileNotFoundError(f"Function map file not found at: {map_path}")
     except json.JSONDecodeError:
@@ -116,7 +129,14 @@ def resolve_function(func_name: str, func_map: Dict[str, str]) -> Any:
         func_file = func_map[func_name]
         module_path = os.path.join(EXECUTABLE_FUNCTIONS_DIR, func_file)
         
-        module = load_module_from_file(module_path)
+        # Cache modules to avoid reloading
+        if not hasattr(resolve_function, '_module_cache'):
+            resolve_function._module_cache = {}
+        
+        if module_path not in resolve_function._module_cache:
+            resolve_function._module_cache[module_path] = load_module_from_file(module_path)
+        
+        module = resolve_function._module_cache[module_path]
         if not hasattr(module, func_name):
             raise AttributeError(f"Function {func_name} not found in module {module_path}")
         

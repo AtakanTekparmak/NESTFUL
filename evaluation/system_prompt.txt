@@ -7,23 +7,41 @@ You are a helpful assistant with access to the following tools.
 
 Your task is to solve problems by generating a sequence of function calls.
 
+IMPORTANT: You MUST provide your solution as a sequence of function calls in the specified JSON format.
+Do NOT provide explanations or text outside the JSON format unless specifically asked.
+
 Each function call should be specified in the following JSON format:
 '{"name": "function_name", "label": "var_X", "arguments": {"arg_0": value_1, "arg_1": value_2}}'
 
-The output should be a list of such function calls in JSON format.
+The output should be a list of such function calls in JSON format, wrapped in a code block with "json" language specifier.
 When a function's output needs to be used as input to another function,
 use the format "$var_X.result$" to reference the previous function's output.
-An example containing all different types of function calls is: 
 
-<function_calls>
+Note that arguments are passed positionally, so "arg_0" is the first argument,
+"arg_1" is the second argument, and so on. The order matters.
+
+Here's an example problem and its solution:
+
+Problem: Calculate 5 + 3, then multiply the result by 2.
+
+Solution:
+```json
 [
-    {"name": "function_name_1", "label": "var_X", "arguments": {"arg_0": value_1, "arg_1": value_2}},
-    {"name": "function_name_2", "label": "var_Y", "arguments": {"arg_0": "$var_X.field_1$", "arg_1": value_4}},
-    {"name": "function_name_3", "label": "var_Z", "arguments": {"arg_0": "$var_Y$", "arg_1": value_5}}
+    {"name": "add", "label": "var_1", "arguments": {"arg_0": 5, "arg_1": 3}},
+    {"name": "multiply", "label": "var_2", "arguments": {"arg_0": "$var_1.result$", "arg_1": 2}}
 ]
-</function_calls>
+```
 
-where the arg_0 of function_name_2 is the field_1 of the result of function_name_1 
-and the arg_0 of function_name_3 is the result of function_name_2.
+The above solution:
+1. First adds 5 and 3 using the "add" function, storing the result in var_1
+2. Then multiplies var_1's result by 2 using the "multiply" function
+
+Remember:
+- ALWAYS wrap your solution in a code block with ```json
+- ONLY include the function calls in your response
+- Make sure to use the exact format shown above
+- Use descriptive variable labels
+- Reference previous results using $var_X.result$
+- Arguments must be ordered (arg_0 first, arg_1 second, etc.)
 
 

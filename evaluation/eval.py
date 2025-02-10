@@ -34,35 +34,64 @@ class NESTFULEvaluator:
         self.function_map = load_function_map()
         logger.info(f"Initialized evaluator with model: {model_name}")
 
-    def parse_function_sequence(self, model_output: str) -> List[Dict]:
-        """Parse the model's output into a structured function sequence"""
+    def parse_function_sequence(self, model_output: str) -> Optional[List[Dict]]:
+        """Parse the function sequence from the model output"""
         try:
-            if self.debug:
-                logger.info(f"Parsing model output: {model_output}")
-                
-            # Find the JSON list in the output
-            start_idx = model_output.find('[')
-            end_idx = model_output.rfind(']') + 1
-            if start_idx == -1 or end_idx == 0:
-                logger.warning("No JSON list found in model output")
-                return []
+            # Try to find JSON list in code blocks
+            json_blocks = []
+            lines = model_output.split('\n')
+            in_code_block = False
+            current_block = []
             
-            json_str = model_output[start_idx:end_idx]
-            sequence = json.loads(json_str)
+            for line in lines:
+                if line.startswith('```'):
+                    if in_code_block:
+                        json_blocks.append('\n'.join(current_block))
+                        current_block = []
+                    in_code_block = not in_code_block
+                    continue
+                if in_code_block:
+                    current_block.append(line)
             
-            # Validate sequence format
-            for call in sequence:
-                if not all(k in call for k in ['name', 'label', 'arguments']):
-                    logger.warning(f"Invalid function call format: {call}")
-                    return []
+            # Try each JSON block
+            for block in json_blocks:
+                try:
+                    # Remove any "json" or other language identifiers
+                    block = block.replace('json\n', '').strip()
+                    sequence = json.loads(block)
+                    
+                    # Validate sequence format
+                    if not isinstance(sequence, list):
+                        continue
+                        
+                    # Convert named arguments to positional arguments
+                    for call in sequence:
+                        if not all(key in call for key in ['name', 'label', 'arguments']):
+                            continue
+                            
+                        # Convert named arguments to positional arguments
+                        args = call['arguments']
+                        if not all(k.startswith('arg_') for k in args.keys()):
+                            # Convert named args to positional args
+                            new_args = {}
+                            for i, (_, value) in enumerate(sorted(args.items())):
+                                new_args[f'arg_{i}'] = value
+                            call['arguments'] = new_args
+                    
+                    logger.info(f"Parsed function sequence from json code block: {str(sequence)[:100]}...")
+                    return sequence
+                except json.JSONDecodeError:
+                    continue
+                except Exception as e:
+                    logger.warning(f"Error parsing json block: {str(e)}")
+                    continue
             
-            if self.debug:
-                logger.info(f"Parsed function sequence: {sequence}")
-                
-            return sequence
+            logger.warning("No valid JSON found in json code blocks")
+            return None
+            
         except Exception as e:
             logger.error(f"Error parsing function sequence: {str(e)}")
-            return []
+            return None
 
     def execute_function_sequence(
         self,
@@ -83,25 +112,27 @@ class NESTFULEvaluator:
                 func = resolve_function(func_name, self.function_map)
                 
                 # Prepare arguments
-                args = {}
-                for arg_name, arg_value in func_call['arguments'].items():
+                args = []
+                for arg_name in sorted(func_call['arguments'].keys()):  # Sort to ensure consistent order
+                    arg_value = func_call['arguments'][arg_name]
                     if isinstance(arg_value, str) and arg_value.startswith('$') and arg_value.endswith('$'):
                         # Handle variable reference
                         var_ref = arg_value[1:-1]
-                        var_name, param = var_ref.split('.')
+                        var_name, field = var_ref.split('.')
                         if var_name not in variables:
                             raise ValueError(f"Unknown variable reference: {var_name}")
-                        if self.debug:
-                            logger.info(f"Resolving variable reference {var_ref} to {variables[var_name][param]}")
-                        args[arg_name] = variables[var_name][param]
+                        if field == 'result':
+                            args.append(variables[var_name]['result'])
+                        else:
+                            args.append(variables[var_name][field])
                     else:
-                        args[arg_name] = arg_value
+                        args.append(arg_value)
                 
                 if self.debug:
                     logger.info(f"Function arguments: {args}")
                 
-                # Execute function
-                result = func(**args)
+                # Execute function with unpacked arguments
+                result = func(*args)  # Use positional arguments
                 
                 # Store result
                 label = func_call['label']
@@ -117,12 +148,62 @@ class NESTFULEvaluator:
         
         return final_result, variables
 
+    def _normalize_param(self, value: Any) -> str:
+        """Normalize parameter values for comparison"""
+        if isinstance(value, str):
+            if value.startswith('$') and value.endswith('$'):
+                # For variable references, just compare the variable name and field
+                parts = value[1:-1].split('.')
+                return f"var_{parts[0]}.{parts[1]}" if len(parts) > 1 else parts[0]
+            return value.lower()  # Case-insensitive comparison for strings
+        elif isinstance(value, (int, float)):
+            # Convert numbers to string with limited precision
+            return f"{float(value):.6f}"
+        elif isinstance(value, list):
+            # For lists, convert each element
+            return '[' + ','.join(self._normalize_param(v) for v in value) + ']'
+        return str(value)
+
+    def _compare_params(self, pred_args: Dict, gold_args: Dict) -> float:
+        """Compare parameters and return a similarity score"""
+        if not pred_args or not gold_args:
+            return 0.0
+        
+        # Get all unique keys
+        all_keys = set(pred_args.keys()) | set(gold_args.keys())
+        matches = 0
+        total = 0
+        
+        for key in sorted(all_keys):  # Sort to ensure consistent order
+            total += 1
+            if key in pred_args and key in gold_args:
+                pred_val = self._normalize_param(pred_args[key])
+                gold_val = self._normalize_param(gold_args[key])
+                
+                # For variable references, compare just the variable part
+                if isinstance(pred_args[key], str) and pred_args[key].startswith('$'):
+                    pred_var = pred_val.split('.')[0]
+                    gold_var = gold_val.split('.')[0]
+                    if pred_var == gold_var:
+                        matches += 0.5  # Partial match for variable name
+                        if pred_val == gold_val:  # Full match including the field
+                            matches += 0.5
+                # For numeric values, allow small differences
+                elif isinstance(pred_args[key], (int, float)) and isinstance(gold_args[key], (int, float)):
+                    if abs(float(pred_args[key]) - float(gold_args[key])) < 1e-6:
+                        matches += 1
+                # For other types, exact match
+                elif pred_val == gold_val:
+                    matches += 1
+        
+        return matches / total if total > 0 else 0.0
+
     def calculate_metrics(
         self,
         predicted: List[Dict],
         gold: List[Dict],
-        executed_result: Optional[float],
-        gold_answer: float
+        executed_result: Optional[Any],
+        gold_answer: Any
     ) -> Dict:
         """Calculate all evaluation metrics"""
         metrics = {
@@ -134,30 +215,66 @@ class NESTFULEvaluator:
         }
         
         try:
-            # F1 for function names
-            pred_funcs = [call['name'] for call in predicted]
-            gold_funcs = [call['name'] for call in gold]
+            if not predicted or not gold:
+                return metrics
+                
+            # Convert gold to list of dicts if it's a list of ToolCall objects
+            if isinstance(gold, list) and len(gold) > 0 and hasattr(gold[0], '__dict__'):
+                gold = [
+                    {
+                        'name': g.name,
+                        'label': g.label,
+                        'arguments': {f'arg_{i}': v for i, v in enumerate(g.arguments)}
+                    }
+                    for g in gold
+                ]
+            
+            # F1 for function names - stricter matching
+            pred_funcs = [(i, call['name']) for i, call in enumerate(predicted)]
+            gold_funcs = [(i, call['name']) for i, call in enumerate(gold)]
             metrics['f1_function'] = self._calculate_f1(pred_funcs, gold_funcs)
             
-            # F1 for parameters
-            pred_params = []
-            gold_params = []
-            for p, g in zip(predicted, gold):
-                pred_params.extend([f"{p['name']}_{k}_{v}" for k, v in p['arguments'].items()])
-                gold_params.extend([f"{g['name']}_{k}_{v}" for k, v in g['arguments'].items()])
-            metrics['f1_param'] = self._calculate_f1(pred_params, gold_params)
+            # F1 for parameters - compare each function's parameters separately
+            param_scores = []
+            for i, (p, g) in enumerate(zip(predicted, gold)):
+                if p['name'] == g['name']:  # Only compare params for matching functions
+                    similarity = self._compare_params(p['arguments'], g['arguments'])
+                    if similarity > 0.5:  # Only count significant matches
+                        param_scores.append(similarity)
             
-            # Partial sequence match
-            correct_calls = sum(1 for p, g in zip(predicted, gold) 
-                              if p['name'] == g['name'] and p['arguments'] == g['arguments'])
-            metrics['partial_match'] = correct_calls / max(len(predicted), len(gold))
+            if param_scores:
+                metrics['f1_param'] = sum(param_scores) / max(len(predicted), len(gold))
             
-            # Full sequence match
-            metrics['full_match'] = float(predicted == gold)
+            # Partial sequence match - count correct function names in sequence
+            min_len = min(len(predicted), len(gold))
+            correct_calls = 0
+            total_calls = max(len(predicted), len(gold))
             
-            # Win rate
-            if executed_result is not None:
-                metrics['win_rate'] = float(abs(executed_result - gold_answer) < 1e-6)
+            for i in range(min_len):
+                p, g = predicted[i], gold[i]
+                # For partial match, check both function name and parameters
+                if p['name'] == g['name']:
+                    param_similarity = self._compare_params(p['arguments'], g['arguments'])
+                    if param_similarity > 0.5:  # Only count significant matches
+                        correct_calls += 1
+            
+            metrics['partial_match'] = correct_calls / total_calls
+            
+            # Full sequence match - requires exact match of everything
+            metrics['full_match'] = float(
+                len(predicted) == len(gold) and 
+                all(p['name'] == g['name'] and self._compare_params(p['arguments'], g['arguments']) > 0.9
+                    for p, g in zip(predicted, gold))
+            )
+            
+            # Win rate - handle both numeric and list results
+            if executed_result is not None and gold_answer is not None:
+                if isinstance(executed_result, (int, float)) and isinstance(gold_answer, (int, float)):
+                    metrics['win_rate'] = float(abs(executed_result - gold_answer) < 1e-6)
+                elif isinstance(executed_result, list) and isinstance(gold_answer, list):
+                    metrics['win_rate'] = float(executed_result == gold_answer)
+                else:
+                    metrics['win_rate'] = float(executed_result == gold_answer)
             
             if self.debug:
                 logger.info(f"Calculated metrics: {metrics}")
@@ -252,37 +369,3 @@ class NESTFULEvaluator:
         # Calculate averages
         num_samples = len(eval_data)
         return {k: v/num_samples for k, v in total_metrics.items()}
-
-def main():
-    """Main function to run the evaluation"""
-    parser = argparse.ArgumentParser(description='Run NESTFUL evaluation')
-    parser.add_argument('--model', required=True, help='Name of the model to evaluate')
-    parser.add_argument('--provider', required=True, help='Provider to use (lm_studio, ollama, vllm, openrouter)')
-    parser.add_argument('--batch-size', type=int, default=8, help='Batch size for evaluation')
-    parser.add_argument('--debug', action='store_true', help='Enable debug logging')
-    
-    args = parser.parse_args()
-    
-    # Initialize evaluator
-    evaluator = NESTFULEvaluator(
-        model_name=args.model,
-        provider=args.provider,
-        debug=args.debug
-    )
-    
-    try:
-        # Run evaluation
-        logger.info(f"Starting evaluation of {args.model} with provider {args.provider}")
-        results = evaluator.evaluate(batch_size=args.batch_size)
-        
-        # Print results
-        print("\nEvaluation Results:")
-        for metric_name, value in results.items():
-            print(f"{metric_name}: {value:.4f}")
-            
-    except Exception as e:
-        logger.error(f"Evaluation failed: {str(e)}", exc_info=True)
-        raise
-
-if __name__ == "__main__":
-    main()
