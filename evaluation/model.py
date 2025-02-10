@@ -43,18 +43,32 @@ def get_completion(
     return response.choices[0].message.content
 
 
-async def get_completions_batch(requests):
+async def get_completions_batch(request):
+    """
+    Get completions for a batch of requests.
+    
+    Args:
+        request: A dictionary containing:
+            - model: The model name
+            - provider: The provider name
+            - system_prompts: List of system prompts
+            - user_prompts: List of user prompts
+    
+    Returns:
+        List of completions
+    """
     loop = asyncio.get_running_loop()
     tasks = []
-    for r in requests:
+    
+    for system_prompt, user_prompt in zip(request["system_prompts"], request["user_prompts"]):
         tasks.append(
             loop.run_in_executor(
                 None,
                 get_completion,
-                r["model_name"],
-                r["provider"],
-                r["system_prompt"],
-                r["user_query"],
+                request["model"],
+                request["provider"],
+                system_prompt,
+                user_prompt,
             )
         )
     return await asyncio.gather(*tasks)

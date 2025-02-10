@@ -1,8 +1,9 @@
 from evaluation.eval import NESTFULEvaluator
-from evaluation.settings import SAVE_RESULTS
+from evaluation.settings import SAVE_RESULTS, BATCH_SIZE
 
 import logging
 import json
+import asyncio
 
 # Setup logging
 logging.basicConfig(
@@ -11,9 +12,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-def main():
+async def main():
     # Model configuration
-    model_name = "google/gemini-2.0-flash-001"
+    model_name = "meta-llama/llama-3.1-8b-instruct"
     provider = "openrouter"
     
     # Initialize evaluator
@@ -26,7 +27,7 @@ def main():
     try:
         # Run evaluation
         logger.info(f"Starting evaluation of {model_name} with provider {provider}")
-        results = evaluator.evaluate(batch_size=1)  # Using small batch size for toy data
+        results = await evaluator.evaluate(batch_size=BATCH_SIZE)  # Using configured batch size
         
         # Print results
         print("\nEvaluation Results:")
@@ -45,4 +46,4 @@ def main():
         raise
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

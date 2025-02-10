@@ -4,6 +4,9 @@ import logging
 from tqdm import tqdm
 import argparse
 import re
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from itertools import islice
 
 from evaluation.model import get_completion, get_completions_batch
 from evaluation.utils import (
@@ -33,6 +36,7 @@ class NESTFULEvaluator:
         self.provider = provider
         self.debug = debug
         self.function_map = load_function_map()
+        self.executor = ThreadPoolExecutor(max_workers=8)  # For CPU-bound tasks
         logger.info(f"Initialized evaluator with model: {model_name}")
 
     def parse_function_sequence(self, model_output: str) -> List[Dict]:
@@ -261,54 +265,55 @@ class NESTFULEvaluator:
             
         return metrics
 
-    def evaluate_sample(self, sample: NestfulRow) -> Dict[str, float]:
-        """Evaluate a single sample"""
-        try:
-            # Prepare the prompt
-            system_prompt = load_system_prompt(sample.tools)
-            
-            # Get model completion
-            model_output = get_completion(
-                self.model_name,
-                self.provider,
-                system_prompt,
-                sample.input
-            )
-            
-            # Parse the function sequence
+    async def evaluate_batch(self, batch: List[NestfulRow]) -> List[Dict[str, float]]:
+        """Evaluate a batch of samples concurrently"""
+        # Prepare system prompts for the batch
+        system_prompts = [load_system_prompt(sample.tools) for sample in batch]
+        
+        # Get model completions for the entire batch
+        model_outputs = await get_completions_batch({
+            "model": self.model_name,
+            "provider": self.provider,
+            "system_prompts": system_prompts,
+            "user_prompts": [sample.input for sample in batch]
+        })
+        
+        # Process each sample in the batch concurrently using ThreadPoolExecutor
+        tasks = []
+        for sample, model_output in zip(batch, model_outputs):
+            # Parse function sequence
             predicted_sequence = self.parse_function_sequence(model_output)
             if not predicted_sequence:
-                return {
+                tasks.append({
                     'f1_function': 0.0,
                     'f1_param': 0.0,
                     'partial_match': 0.0,
                     'full_match': 0.0,
                     'win_rate': 0.0
-                }
+                })
+                continue
             
-            # Execute the sequence
-            executed_result, _ = self.execute_function_sequence(predicted_sequence)
+            # Execute sequence and calculate metrics
+            executed_result, _ = await asyncio.get_event_loop().run_in_executor(
+                self.executor,
+                self.execute_function_sequence,
+                predicted_sequence
+            )
             
-            # Calculate metrics
-            return self.calculate_metrics(
+            metrics = await asyncio.get_event_loop().run_in_executor(
+                self.executor,
+                self.calculate_metrics,
                 predicted_sequence,
                 sample.output,
                 executed_result,
                 sample.gold_answer
             )
-            
-        except Exception as e:
-            logger.error(f"Error evaluating sample: {str(e)}")
-            return {
-                'f1_function': 0.0,
-                'f1_param': 0.0,
-                'partial_match': 0.0,
-                'full_match': 0.0,
-                'win_rate': 0.0
-            }
+            tasks.append(metrics)
+        
+        return tasks
 
-    def evaluate(self, batch_size: int = 8) -> Dict[str, float]:
-        """Evaluate all samples in the dataset"""
+    async def evaluate(self, batch_size: int = 8) -> Dict[str, float]:
+        """Evaluate all samples in the dataset using batched processing"""
         # Load evaluation data
         eval_data = load_data()
         
@@ -321,11 +326,20 @@ class NESTFULEvaluator:
             'win_rate': 0.0
         }
         
-        # Process samples
-        for sample in tqdm(eval_data, desc="Evaluating samples"):
-            metrics = self.evaluate_sample(sample)
-            for k, v in metrics.items():
-                total_metrics[k] += v
+        # Process samples in batches
+        batches = [list(islice(eval_data, i, i + batch_size)) 
+                  for i in range(0, len(eval_data), batch_size)]
+        
+        with tqdm(total=len(eval_data), desc="Evaluating samples") as pbar:
+            for batch in batches:
+                batch_metrics = await self.evaluate_batch(batch)
+                
+                # Aggregate batch results
+                for metrics in batch_metrics:
+                    for k, v in metrics.items():
+                        total_metrics[k] += v
+                
+                pbar.update(len(batch))
         
         # Calculate averages
         num_samples = len(eval_data)
