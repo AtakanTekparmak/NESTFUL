@@ -133,49 +133,52 @@ class NESTFULEvaluator:
         
         return final_result, variables
 
-    def _normalize_param(self, value: Any) -> str:
-        """Normalize parameter values for comparison"""
-        if isinstance(value, str):
-            # For variable references, normalize to standard format
-            if value.startswith('$') and value.endswith('$'):
-                parts = value[1:-1].split('.')
-                return f"${parts[0]}.{parts[1]}$" if len(parts) > 1 else f"${parts[0]}$"
-            return value.lower()
-        elif isinstance(value, (int, float)):
-            # Convert numbers to string with limited precision
-            return f"{float(value):.6f}"
-        elif isinstance(value, list):
-            # For lists, convert each element
-            return '[' + ','.join(self._normalize_param(v) for v in value) + ']'
+    def _normalize_var_ref(self, value: Any) -> str:
+        """Normalize variable references for comparison"""
+        if isinstance(value, str) and value.startswith('$') and value.endswith('$'):
+            # Extract just the variable name and field
+            parts = value[1:-1].split('.')
+            return f"{parts[0]}.{parts[1]}" if len(parts) > 1 else parts[0]
         return str(value)
 
     def _compare_params(self, pred_args: Dict, gold_args: Dict) -> float:
-        """Compare parameters and return a similarity score"""
+        """Compare parameters with proper handling of variable references"""
         if not pred_args or not gold_args:
+            return 0.0
+        
+        if len(pred_args) != len(gold_args):
             return 0.0
         
         total_matches = 0
         total_params = len(gold_args)
         
+        # Convert arguments to sets of values for each position
+        pred_values = {i: self._normalize_var_ref(v) for i, v in pred_args.items()}
+        gold_values = {i: self._normalize_var_ref(v) for i, v in gold_args.items()}
+        
         for key in gold_args:
             if key not in pred_args:
                 continue
                 
-            pred_val = self._normalize_param(pred_args[key])
-            gold_val = self._normalize_param(gold_args[key])
+            pred_val = pred_values[key]
+            gold_val = gold_values[key]
             
-            # Exact match for variable references
-            if ('$' in pred_val and '$' in gold_val):
-                if pred_val == gold_val:
-                    total_matches += 1
-            # Numeric comparison with tolerance
-            elif isinstance(pred_args[key], (int, float)) and isinstance(gold_args[key], (int, float)):
+            # Handle numeric values
+            if all(isinstance(v, (int, float)) for v in [pred_args[key], gold_args[key]]):
                 if abs(float(pred_args[key]) - float(gold_args[key])) < 1e-6:
                     total_matches += 1
-            # String comparison
-            elif pred_val == gold_val:
+                    continue
+                    
+            # Handle variable references - order independent
+            if '$' in str(pred_args[key]) and '$' in str(gold_args[key]):
+                if pred_val == gold_val:
+                    total_matches += 1
+                    continue
+            
+            # Exact match for other cases
+            if pred_val == gold_val:
                 total_matches += 1
-                
+        
         return total_matches / total_params if total_params > 0 else 0.0
 
     def _calculate_f1(self, predicted: List[Dict], gold: List[Dict], compare_params: bool = False) -> float:
@@ -208,7 +211,7 @@ class NESTFULEvaluator:
         executed_result: Optional[Any],
         gold_answer: Any
     ) -> Dict:
-        """Calculate all evaluation metrics"""
+        """Calculate metrics with corrected definitions"""
         metrics = {
             'f1_function': 0.0,
             'f1_param': 0.0,
@@ -225,32 +228,53 @@ class NESTFULEvaluator:
             if isinstance(gold[0], ToolCall):
                 gold = [{'name': g.name, 'label': g.label, 'arguments': g.arguments} for g in gold]
             
-            # F1 for function names only
-            metrics['f1_function'] = self._calculate_f1(predicted, gold, compare_params=False)
+            # F1 for function names - order independent
+            true_positives = sum(1 for p in predicted if any(g['name'] == p['name'] for g in gold))
+            precision = true_positives / len(predicted) if predicted else 0
+            recall = true_positives / len(gold) if gold else 0
+            metrics['f1_function'] = 2 * (precision * recall) / (precision + recall) if precision + recall > 0 else 0.0
             
-            # F1 for parameters
-            metrics['f1_param'] = self._calculate_f1(predicted, gold, compare_params=True)
+            # F1 for parameters - consider each function's parameters separately
+            param_matches = 0
+            for p in predicted:
+                for g in gold:
+                    if p['name'] == g['name']:
+                        param_score = self._compare_params(p['arguments'], g['arguments'])
+                        if param_score > 0.5:  # Count significant matches
+                            param_matches += param_score
+                            break
             
-            # Partial sequence match
+            param_precision = param_matches / len(predicted) if predicted else 0
+            param_recall = param_matches / len(gold) if gold else 0
+            metrics['f1_param'] = 2 * (param_precision * param_recall) / (param_precision + param_recall) if param_precision + param_recall > 0 else 0.0
+            
+            # Partial match - count correct functions in order with relaxed parameter matching
             correct_sequence = 0
             for i, (p, g) in enumerate(zip(predicted[:len(gold)], gold)):
-                if p['name'] == g['name']:
-                    param_similarity = self._compare_params(p['arguments'], g['arguments'])
-                    if param_similarity > 0.8:
-                        correct_sequence += 1
-            
+                if p['name'] != g['name']:
+                    break
+                param_score = self._compare_params(p['arguments'], g['arguments'])
+                if param_score > 0.5:  # Allow partial parameter matches
+                    correct_sequence += 1
+                else:
+                    break
+                    
             metrics['partial_match'] = correct_sequence / len(gold) if gold else 0
             
-            # Full sequence match - requires exact match of everything
-            sequence_match = (len(predicted) == len(gold))
-            if sequence_match:
+            # Full match - requires exact function sequence with correct variable dependencies
+            full_match = len(predicted) == len(gold)
+            if full_match:
                 for p, g in zip(predicted, gold):
-                    if p['name'] != g['name'] or self._compare_params(p['arguments'], g['arguments']) < 0.9:
-                        sequence_match = False
+                    if p['name'] != g['name']:
+                        full_match = False
                         break
-            metrics['full_match'] = float(sequence_match)
+                    # For full match, require high parameter similarity
+                    if self._compare_params(p['arguments'], g['arguments']) < 0.9:
+                        full_match = False
+                        break
+            metrics['full_match'] = float(full_match)
             
-            # Win rate
+            # Win rate - exact match for numeric results
             if executed_result is not None and gold_answer is not None:
                 if isinstance(executed_result, (int, float)) and isinstance(gold_answer, (int, float)):
                     metrics['win_rate'] = float(abs(executed_result - gold_answer) < 1e-6)

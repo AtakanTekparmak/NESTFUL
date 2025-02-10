@@ -8,7 +8,7 @@ load_dotenv()
 SHOW_COMPLETION = False
 SAVE_RESULTS = False
 SYSTEM_PROMPT_PATH = "evaluation/system_prompt.txt"
-DATA_PATH = "data_v2/toy_data.jsonl"
+DATA_PATH = "data_v2/nestful_data.jsonl"
 TOY_DATA_PATH = "data_v2/toy_data.jsonl"
 BATCH_SIZE = 64
 
