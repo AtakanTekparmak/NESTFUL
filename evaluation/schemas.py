@@ -1,11 +1,11 @@
 from pydantic import BaseModel
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 class Tool(BaseModel):
     name: str
     description: str
     parameters: Dict[str, Any]
-    output_parameter: Dict[str, Any]
+    output_parameter: Optional[Dict[str, Any]] = None
 
 class ToolCall(BaseModel):
     name: str
