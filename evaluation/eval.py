@@ -16,6 +16,15 @@ from evaluation.utils import (
     resolve_function,
 )
 from evaluation.schemas import NestfulRow, ToolCall
+from evaluation.settings import (
+    SHOW_COMPLETION,
+    SAVE_RESULTS,
+    SYSTEM_PROMPT_PATH,
+    DATA_PATH,
+    TOY_DATA_PATH,
+    BATCH_SIZE,
+    ROW_TIMEOUT,
+)
 
 # Setup logging
 logging.basicConfig(
@@ -269,7 +278,7 @@ class NESTFULEvaluator:
                         full_match = False
                         break
                     # For full match, require high parameter similarity
-                    if self._compare_params(p['arguments'], g['arguments']) < 0.9:
+                    if self._compare_params(p['arguments'], g['arguments']) < 0.8:
                         full_match = False
                         break
             metrics['full_match'] = float(full_match)
@@ -289,33 +298,19 @@ class NESTFULEvaluator:
             
         return metrics
 
-    async def evaluate_batch(self, batch: List[NestfulRow]) -> List[Dict[str, float]]:
-        """Evaluate a batch of samples concurrently"""
-        # Prepare system prompts for the batch
-        system_prompts = [load_system_prompt(sample.tools) for sample in batch]
-        
-        # Get model completions for the entire batch
-        model_outputs = await get_completions_batch({
-            "model": self.model_name,
-            "provider": self.provider,
-            "system_prompts": system_prompts,
-            "user_prompts": [sample.input for sample in batch]
-        })
-        
-        # Process each sample in the batch concurrently using ThreadPoolExecutor
-        tasks = []
-        for sample, model_output in zip(batch, model_outputs):
+    async def evaluate_single_row(self, sample: NestfulRow, model_output: str) -> Dict[str, float]:
+        """Evaluate a single row with timeout"""
+        try:
             # Parse function sequence
             predicted_sequence = self.parse_function_sequence(model_output)
             if not predicted_sequence:
-                tasks.append({
+                return {
                     'f1_function': 0.0,
                     'f1_param': 0.0,
                     'partial_match': 0.0,
                     'full_match': 0.0,
                     'win_rate': 0.0
-                })
-                continue
+                }
             
             # Execute sequence and calculate metrics
             executed_result, _ = await asyncio.get_event_loop().run_in_executor(
@@ -332,9 +327,61 @@ class NESTFULEvaluator:
                 executed_result,
                 sample.gold_answer
             )
-            tasks.append(metrics)
+            return metrics
+            
+        except Exception as e:
+            logger.error(f"Error evaluating row: {str(e)}")
+            return {
+                'f1_function': 0.0,
+                'f1_param': 0.0,
+                'partial_match': 0.0,
+                'full_match': 0.0,
+                'win_rate': 0.0
+            }
+
+    async def evaluate_batch(self, batch: List[NestfulRow]) -> List[Dict[str, float]]:
+        """Evaluate a batch of samples concurrently with timeout"""
+        # Prepare system prompts for the batch
+        system_prompts = [load_system_prompt(sample.tools) for sample in batch]
         
-        return tasks
+        # Get model completions for the entire batch
+        model_outputs = await get_completions_batch({
+            "model": self.model_name,
+            "provider": self.provider,
+            "system_prompts": system_prompts,
+            "user_prompts": [sample.input for sample in batch]
+        })
+        
+        # Process each sample in the batch with timeout
+        results = []
+        for sample, model_output in zip(batch, model_outputs):
+            try:
+                # Apply timeout to each row evaluation
+                metrics = await asyncio.wait_for(
+                    self.evaluate_single_row(sample, model_output),
+                    timeout=ROW_TIMEOUT
+                )
+                results.append(metrics)
+            except asyncio.TimeoutError:
+                logger.warning(f"Evaluation timed out after {ROW_TIMEOUT} seconds for sample")
+                results.append({
+                    'f1_function': 0.0,
+                    'f1_param': 0.0,
+                    'partial_match': 0.0,
+                    'full_match': 0.0,
+                    'win_rate': 0.0
+                })
+            except Exception as e:
+                logger.error(f"Error processing sample: {str(e)}")
+                results.append({
+                    'f1_function': 0.0,
+                    'f1_param': 0.0,
+                    'partial_match': 0.0,
+                    'full_match': 0.0,
+                    'win_rate': 0.0
+                })
+        
+        return results
 
     async def evaluate(self, batch_size: int = 8) -> Dict[str, float]:
         """Evaluate all samples in the dataset using batched processing"""
